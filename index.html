@@ -1,366 +1,419 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Karisuke | チャンネルをつなぐ翻訳Bot</title>
-<meta name="description" content="Karisukeは、Discordサーバー内のチャンネルをつないで、メッセージを各チャンネルの言語に自動で翻訳して届けるBotです。">
-<style>
-:root {
-  --bg: #f1f2fc;
-  --surface: #ffffff;
-  --ink: #171a33;
-  --muted: #565b7a;
-  --blurple: #5865f2;
-  --blurple-dark: #3f4bd0;
-  --mint: #2bc7a5;
-  --sun: #ffc94d;
-  --line: #d9dcf2;
-  --font: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Noto Sans JP", "Meiryo", system-ui, sans-serif;
+import 'dotenv/config';
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  Collection,
+  WebhookClient,
+  Events,
+  REST,
+  Routes,
+} from 'discord.js';
+import * as deepl from 'deepl-node';
+import { readdirSync } from 'fs';
+import { fileURLToPath, pathToFileURL } from 'url';
+import path from 'path';
+import { getAll, has, getBannedUsers } from './registry.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const translator = new deepl.Translator(process.env.DEEPL_API_KEY);
+
+// DeepLの使用量を10分ごとに確認する
+let usageCache = { at: 0, limitReached: false };
+async function translationAvailable() {
+  if (Date.now() - usageCache.at < 10 * 60 * 1000) return !usageCache.limitReached;
+  try {
+    const usage = await translator.getUsage();
+    usageCache = { at: Date.now(), limitReached: usage.anyLimitReached() };
+    if (usage.character) {
+      const pct = Math.round((usage.character.count / usage.character.limit) * 100);
+      if (pct >= 90) console.warn(`⚠️ DeepLの使用量が${pct}%です`);
+    }
+  } catch (err) {
+    console.error('使用量の確認に失敗:', err.message);
+    usageCache = { at: Date.now(), limitReached: false };
+  }
+  return !usageCache.limitReached;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #12142b;
-    --surface: #1c1f3f;
-    --ink: #eceefc;
-    --muted: #a3a8cc;
-    --line: #2c3060;
+// 元のメッセージID → { content, quote, channelId, records, reactions }
+// （削除・編集・リアクションの連動用）
+const forwarded = new Map();
+// 元・転送先どちらのメッセージIDからでも、元のIDを引けるようにする
+const groupIndex = new Map();
+
+function remember(originId, entry) {
+  forwarded.set(originId, entry);
+  groupIndex.set(originId, originId);
+  for (const r of entry.records) groupIndex.set(r.id, originId);
+  // 古いものから消して、最大2000件
+  if (forwarded.size > 2000) forget(forwarded.keys().next().value);
+}
+
+function forget(originId) {
+  const entry = forwarded.get(originId);
+  if (!entry) return;
+  groupIndex.delete(originId);
+  for (const r of entry.records) groupIndex.delete(r.id);
+  forwarded.delete(originId);
+}
+
+// 誰が何を押したかの行（転送先メッセージの下に付ける）
+function reactionLine(entry) {
+  if (!entry.reactions || entry.reactions.size === 0) return null;
+  const parts = [...entry.reactions.values()].map((r) => {
+    const names = [...r.names.values()];
+    const shown = names.slice(0, 8).join(', ');
+    const rest = names.length > 8 ? ` 他${names.length - 8}人` : '';
+    return `${r.emoji} ${shown}${rest}`;
+  });
+  return '-# ' + parts.join(' ／ ');
+}
+
+function withReactions(entry, base) {
+  const line = reactionLine(entry);
+  if (!line) return base;
+  const room = 2000 - line.length - 1;
+  return [base?.slice(0, room), line].filter(Boolean).join('\n');
+}
+
+// 転送先のメッセージ全部の「押した人の行」を書き換える
+async function refreshReactionLines(entry) {
+  await Promise.allSettled(
+    entry.records.map(async (rec) => {
+      try {
+        const webhook = new WebhookClient({
+          id: rec.info.webhookId,
+          token: rec.info.webhookToken,
+        });
+        await webhook.editMessage(rec.id, {
+          content: withReactions(entry, rec.content) ?? '',
+          allowedMentions: { parse: [] },
+        });
+      } catch (err) {
+        console.error('リアクション表示の更新に失敗:', err.message);
+      }
+    })
+  );
+}
+
+async function displayName(message, user) {
+  try {
+    const member = await message.guild.members.fetch(user.id);
+    return member.displayName;
+  } catch {
+    return user.username ?? '???';
   }
 }
 
-* { box-sizing: border-box; }
-
-html { scroll-behavior: smooth; }
-
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--font);
-  line-height: 1.8;
-  -webkit-text-size-adjust: 100%;
+// 言語ごとに1回だけ翻訳する関数を作る
+function makeTranslateTo(content, canTranslate) {
+  const cache = {};
+  return async function translateTo(lang) {
+    if (!content || !lang || !canTranslate) return content;
+    if (cache[lang] !== undefined) return cache[lang];
+    try {
+      const result = await translator.translateText(content, null, lang);
+      cache[lang] = result.text;
+    } catch (err) {
+      console.error('翻訳失敗:', err.message);
+      cache[lang] = content;
+    }
+    return cache[lang];
+  };
 }
 
-a { color: inherit; }
-a:focus-visible, .btn:focus-visible {
-  outline: 3px solid var(--sun);
-  outline-offset: 3px;
-  border-radius: 8px;
+// 返信先の引用（名前と本文の冒頭）を作る
+async function buildQuote(message) {
+  if (!message.reference?.messageId) return null;
+  try {
+    const ref = await message.fetchReference();
+    const name = (ref.member?.displayName ?? ref.author.username).slice(0, 40);
+    let snippet = ref.content
+      .split('\n')
+      .filter((l) => !l.startsWith('> ') && !l.startsWith('-# '))
+      .join(' ')
+      .trim();
+    if (snippet.length > 60) snippet = snippet.slice(0, 60) + '…';
+    if (!snippet) snippet = ref.attachments.size > 0 ? '📎' : '';
+    return snippet ? { name, snippet } : null;
+  } catch {
+    return null;
+  }
 }
 
-/* ヘッダー */
-.top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 20px 24px;
-}
-.brand {
-  font-size: 1.25rem;
-  font-weight: 800;
-  letter-spacing: 0.02em;
-  text-decoration: none;
-}
-.top nav { display: flex; gap: 20px; font-size: 0.92rem; }
-.top nav a { text-decoration: none; color: var(--muted); }
-.top nav a:hover { color: var(--ink); }
+// 転送先に送る本文を作る
+async function render(message, info, translateTo, canTranslate, quote, quoteTranslateTo) {
+  const text = await translateTo(info.language);
 
-/* ヒーロー */
-.hero {
-  display: grid;
-  grid-template-columns: 1.05fr 1fr;
-  gap: 48px;
-  align-items: center;
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 40px 24px 88px;
-}
-.hero h1 {
-  margin: 0 0 20px;
-  font-size: clamp(2rem, 4.6vw, 3.2rem);
-  font-weight: 800;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
-}
-.hero p { margin: 0 0 32px; color: var(--muted); max-width: 34em; }
+  let quoteLine = null;
+  if (quote) {
+    const q = (await quoteTranslateTo(info.language)).replace(/\n/g, ' ');
+    quoteLine = `> ↩ **${quote.name}**: ${q}`;
+  }
 
-.actions { display: flex; flex-wrap: wrap; gap: 12px; }
-.btn {
-  display: inline-block;
-  padding: 14px 28px;
-  border-radius: 999px;
-  font-weight: 700;
-  text-decoration: none;
-  transition: transform 0.15s, background 0.15s;
-}
-.btn.primary { background: var(--blurple); color: #fff; }
-.btn.primary:hover { background: var(--blurple-dark); transform: translateY(-2px); }
-.btn.ghost { border: 2px solid var(--line); }
-.btn.ghost:hover { border-color: var(--blurple); }
+  const notice = !canTranslate && message.content && info.language
+    ? '-# ⚠️ 翻訳の上限に達したため、原文のまま転送しています' : null;
+  const attachmentUrls = [...message.attachments.values()].map((a) => a.url);
 
-/* 翻訳のデモ（ページ読み込み時に1回だけ動く） */
-.stage { display: grid; gap: 14px; }
-.room {
-  position: relative;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 34px 20px 18px;
-}
-.room.en { margin-left: 28px; }
-.room.ko { margin-left: 56px; }
-.chan {
-  position: absolute;
-  top: 10px;
-  left: 20px;
-  font-size: 0.8rem;
-  font-weight: 700;
-  color: var(--muted);
-}
-.msg { display: flex; gap: 12px; align-items: flex-start; }
-.msg b { font-size: 0.9rem; }
-.msg p { margin: 2px 0 0; font-size: 1.05rem; color: var(--ink); }
-.av {
-  flex: none;
-  width: 38px;
-  height: 38px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  font-style: normal;
-  font-weight: 800;
-  color: #fff;
-  background: var(--blurple);
-}
-.room.en .av { background: var(--mint); }
-.room.ko .av { background: var(--sun); color: #3a2f00; }
-
-.msg { opacity: 0; transform: translateY(8px); animation: pop 0.5s ease forwards; }
-.m1 { animation-delay: 0.3s; }
-.m2 { animation-delay: 1.1s; }
-.m3 { animation-delay: 1.7s; }
-@keyframes pop { to { opacity: 1; transform: none; } }
-
-/* セクション共通 */
-.block {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 72px 24px;
-  border-top: 1px solid var(--line);
-}
-.block h2, .cta h2 {
-  margin: 0 0 28px;
-  font-size: clamp(1.5rem, 3vw, 2rem);
-  font-weight: 800;
-  line-height: 1.4;
-}
-.lead { margin: -12px 0 24px; color: var(--muted); }
-
-code {
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.9em;
-  background: color-mix(in srgb, var(--blurple) 12%, transparent);
-  color: var(--blurple-dark);
-  padding: 2px 8px;
-  border-radius: 6px;
-  white-space: nowrap;
-}
-@media (prefers-color-scheme: dark) {
-  code { color: #b9c0ff; }
+  const body = [quoteLine, text, notice, ...attachmentUrls].filter(Boolean).join('\n');
+  return body ? body.slice(0, 2000) : null;
 }
 
-/* 使い方 */
-.steps {
-  list-style: none;
-  counter-reset: step;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 28px;
-  max-width: 720px;
-}
-.steps li {
-  counter-increment: step;
-  position: relative;
-  padding-left: 68px;
-}
-.steps li::before {
-  content: counter(step);
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 46px;
-  height: 46px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  font-weight: 800;
-  font-size: 1.15rem;
-  color: #fff;
-  background: var(--blurple);
-}
-.steps li:nth-child(2)::before { background: var(--mint); }
-.steps li:nth-child(3)::before { background: var(--sun); color: #3a2f00; }
-.steps h3 { margin: 0 0 4px; font-size: 1.15rem; }
-.steps p { margin: 0; color: var(--muted); }
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildWebhooks,
+    GatewayIntentBits.GuildMessageReactions,
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+});
 
-/* コマンド表 */
-.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
-table { width: 100%; border-collapse: collapse; min-width: 560px; }
-th, td { padding: 16px 20px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { font-size: 0.85rem; color: var(--muted); font-weight: 700; }
-tbody tr:last-child td { border-bottom: none; }
-td:last-child { color: var(--muted); white-space: nowrap; }
+client.commands = new Collection();
+const commandsPath = path.join(__dirname, 'commands');
+const commandFiles = readdirSync(commandsPath).filter((f) => f.endsWith('.js'));
 
-/* 言語 */
-.chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
-.chips li {
-  padding: 8px 18px;
-  border-radius: 999px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  font-weight: 600;
+for (const file of commandFiles) {
+  const filePath = pathToFileURL(path.join(commandsPath, file)).href;
+  const command = await import(filePath);
+  if ('data' in command && 'execute' in command) {
+    client.commands.set(command.data.name, command);
+  }
 }
 
-/* 導入 */
-.cta {
-  max-width: 1080px;
-  margin: 24px auto 0;
-  padding: 64px 24px;
-  text-align: center;
-  background: var(--blurple);
-  color: #fff;
-  border-radius: 28px;
-}
-.cta h2 { margin-bottom: 12px; }
-.cta p { max-width: 34em; margin: 0 auto 28px; opacity: 0.9; }
-.cta .btn.primary { background: #fff; color: var(--blurple-dark); }
-.cta .btn.primary:hover { background: var(--sun); color: #3a2f00; }
-main { padding-bottom: 24px; }
+client.once(Events.ClientReady, async (c) => {
+  console.log(`✅ Logged in as ${c.user.tag}`);
+  try {
+    const rest = new REST().setToken(process.env.DISCORD_TOKEN);
+    await rest.put(Routes.applicationCommands(c.user.id), {
+      body: [...client.commands.values()].map((cmd) => cmd.data.toJSON()),
+    });
+    console.log('✅ スラッシュコマンドを登録しました');
+  } catch (err) {
+    console.error('コマンド登録失敗:', err.message);
+  }
+});
 
-footer { text-align: center; padding: 32px 24px 48px; color: var(--muted); font-size: 0.9rem; }
-footer p { margin: 0; }
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const command = client.commands.get(interaction.commandName);
+  if (!command) return;
+  try {
+    await command.execute(interaction, client);
+  } catch (err) {
+    console.error(err);
+    const reply = { content: '❌ エラーが発生しました。', ephemeral: true };
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp(reply);
+    } else {
+      await interaction.reply(reply);
+    }
+  }
+});
 
-/* スマホ */
-@media (max-width: 820px) {
-  .hero { grid-template-columns: 1fr; gap: 40px; padding-bottom: 64px; }
-  .top nav { gap: 14px; font-size: 0.85rem; }
-  .block { padding: 56px 20px; }
-  .cta { margin: 24px 16px 0; border-radius: 22px; padding: 48px 20px; }
-  .room.en { margin-left: 16px; }
-  .room.ko { margin-left: 32px; }
-}
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  if (message.webhookId) return;
+  if (!has(message.channelId)) return;
 
-@media (prefers-reduced-motion: reduce) {
-  html { scroll-behavior: auto; }
-  .msg { animation: none; opacity: 1; transform: none; }
-  .btn { transition: none; }
-}
-</style>
-</head>
-<body>
+  const banned = getBannedUsers(message.guildId);
+  if (banned.includes(message.author.id)) return;
 
-<header class="top">
-  <a class="brand" href="#">Karisuke</a>
-  <nav>
-    <a href="#howto">使い方</a>
-    <a href="#commands">コマンド</a>
-    <a href="#languages">対応言語</a>
-  </nav>
-</header>
+  const channels = getAll();
 
-<main>
-  <section class="hero">
-    <div class="hero-text">
-      <h1>言語ごとのチャンネルを、ひとつの会話にする。</h1>
-      <p>Karisukeは、サーバー内のチャンネルをつなぐ翻訳Botです。どのチャンネルで話しても、メッセージは各チャンネルの言語に翻訳されて届きます。</p>
-      <div class="actions">
-        <a class="btn primary" href="https://discord.com/oauth2/authorize?client_id=1549703383873486918&permissions=536939584&scope=bot%20applications.commands">Discordに追加</a>
-        <a class="btn ghost" href="#howto">使い方を見る</a>
-      </div>
-    </div>
+  // 同じサーバー内の、他のチャンネルだけ
+  const targets = Object.entries(channels).filter(
+    ([channelId, info]) =>
+      channelId !== message.channelId && info.guildId === message.guildId
+  );
+  if (targets.length === 0) return;
 
-    <div class="stage" aria-label="日本語で送ったメッセージが英語と韓国語に翻訳される例">
-      <div class="room ja">
-        <span class="chan">#日本語</span>
-        <div class="msg m1"><i class="av">あ</i><div><b>あらた</b><p>今日の夜ひま？</p></div></div>
-      </div>
-      <div class="room en">
-        <span class="chan">#english</span>
-        <div class="msg m2"><i class="av">あ</i><div><b>あらた</b><p>Are you free tonight?</p></div></div>
-      </div>
-      <div class="room ko">
-        <span class="chan">#한국어</span>
-        <div class="msg m3"><i class="av">あ</i><div><b>あらた</b><p>오늘 밤에 시간 있어?</p></div></div>
-      </div>
-    </div>
-  </section>
+  const canTranslate = await translationAvailable();
+  const translateTo = makeTranslateTo(message.content, canTranslate);
 
-  <section id="howto" class="block">
-    <h2>3ステップで使えます</h2>
-    <ol class="steps">
-      <li>
-        <h3>Botを招待する</h3>
-        <p>このページの「Discordに追加」から、自分のサーバーにKarisukeを追加します。</p>
-      </li>
-      <li>
-        <h3>チャンネルを登録する</h3>
-        <p>つなぎたいチャンネルごとに <code>/global-join</code> を実行し、そのチャンネルで使う言語を選びます。</p>
-      </li>
-      <li>
-        <h3>いつも通り話す</h3>
-        <p>登録したチャンネルのどこかで送ったメッセージが、他のチャンネルに翻訳されて届きます。名前とアイコンは送った人のままです。</p>
-      </li>
-    </ol>
-  </section>
+  const quote = await buildQuote(message);
+  const quoteTranslateTo = makeTranslateTo(quote?.snippet, canTranslate);
 
-  <section id="commands" class="block">
-    <h2>コマンド</h2>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>コマンド</th><th>できること</th><th>必要な権限</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><code>/global-join</code></td><td>このチャンネルをつなぎます。言語を選びます。</td><td>チャンネルの管理</td></tr>
-          <tr><td><code>/global-leave</code></td><td>このチャンネルの接続を解除します。</td><td>チャンネルの管理</td></tr>
-          <tr><td><code>/global-list</code></td><td>つながっているチャンネルを一覧で表示します。</td><td>なし</td></tr>
-          <tr><td><code>/global-ban add</code></td><td>指定したユーザーのメッセージを転送しないようにします。</td><td>メンバーをBAN</td></tr>
-          <tr><td><code>/global-ban remove</code></td><td>転送の停止を解除します。</td><td>メンバーをBAN</td></tr>
-          <tr><td><code>/global-ban list</code></td><td>転送を止めているユーザーを表示します。</td><td>メンバーをBAN</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
+  const username = (message.member?.displayName ?? message.author.username).slice(0, 80);
+  const avatarURL = message.author.displayAvatarURL({ extension: 'png', size: 128 }) ?? undefined;
 
-  <section id="languages" class="block">
-    <h2>対応言語</h2>
-    <p class="lead">チャンネルごとに、次の13言語から選べます。</p>
-    <ul class="chips">
-      <li>日本語</li><li>英語</li><li>韓国語</li><li>中国語（簡体字）</li>
-      <li>スペイン語</li><li>フランス語</li><li>ドイツ語</li><li>ポルトガル語</li>
-      <li>ロシア語</li><li>イタリア語</li><li>インドネシア語</li><li>トルコ語</li>
-      <li>アラビア語</li>
-    </ul>
-  </section>
+  const records = [];
 
-  <section class="cta">
-    <h2>自分のサーバーでも、言葉の壁をなくそう。</h2>
-    <p>追加するときに、次の権限を許可してください：チャンネルを見る、メッセージを送信、メッセージ履歴を読む、ウェブフックの管理。</p>
-    <a class="btn primary" href="https://discord.com/oauth2/authorize?client_id=1549703383873486918&permissions=536939584&scope=bot%20applications.commands">Discordに追加</a>
-  </section>
-</main>
+  await Promise.allSettled(
+    targets.map(async ([channelId, info]) => {
+      try {
+        const finalContent = await render(
+          message, info, translateTo, canTranslate, quote, quoteTranslateTo
+        );
 
-<footer>
-  <p>Karisuke ／ 翻訳にはDeepLを使用しています。</p>
-</footer>
+        const webhook = new WebhookClient({
+          id: info.webhookId,
+          token: info.webhookToken,
+        });
+        const sent = await webhook.send({
+          content: finalContent,
+          embeds: message.embeds.slice(0, 10),
+          username,
+          avatarURL,
+          allowedMentions: { parse: [] },
+        });
+        records.push({ info, id: sent.id, channelId, content: finalContent });
+      } catch (err) {
+        console.error(`転送失敗 → ${channelId}:`, err.message);
+      }
+    })
+  );
 
-</body>
-</html>
+  if (records.length > 0) {
+    remember(message.id, {
+      content: message.content,
+      quote,
+      channelId: message.channelId,
+      records,
+      reactions: new Map(),
+    });
+  }
+});
 
+// 元のメッセージが編集されたら、転送先も書き換える
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  const entry = forwarded.get(newMessage.id);
+  if (!entry) return;
 
+  if (newMessage.partial) {
+    try {
+      newMessage = await newMessage.fetch();
+    } catch {
+      return;
+    }
+  }
 
+  // 本文が変わっていない更新（リンクのプレビュー表示など）は無視
+  if (newMessage.content === entry.content) return;
+  entry.content = newMessage.content;
+
+  const canTranslate = await translationAvailable();
+  const translateTo = makeTranslateTo(newMessage.content, canTranslate);
+  const quoteTranslateTo = makeTranslateTo(entry.quote?.snippet, canTranslate);
+
+  await Promise.allSettled(
+    entry.records.map(async (rec) => {
+      try {
+        const finalContent = await render(
+          newMessage, rec.info, translateTo, canTranslate, entry.quote, quoteTranslateTo
+        );
+        if (!finalContent) return;
+        rec.content = finalContent;
+
+        const webhook = new WebhookClient({
+          id: rec.info.webhookId,
+          token: rec.info.webhookToken,
+        });
+        await webhook.editMessage(rec.id, {
+          content: withReactions(entry, finalContent),
+          allowedMentions: { parse: [] },
+        });
+      } catch (err) {
+        console.error('転送先の編集に失敗:', err.message);
+      }
+    })
+  );
+});
+
+// 元のメッセージが消されたら、転送先も消す
+client.on(Events.MessageDelete, async (message) => {
+  const entry = forwarded.get(message.id);
+  if (!entry) return;
+  forget(message.id);
+
+  await Promise.allSettled(
+    entry.records.map(async ({ info, id }) => {
+      try {
+        const webhook = new WebhookClient({
+          id: info.webhookId,
+          token: info.webhookToken,
+        });
+        await webhook.deleteMessage(id);
+      } catch (err) {
+        console.error('転送先の削除に失敗:', err.message);
+      }
+    })
+  );
+});
+
+// リアクションが付いたら、他のコピーにも付けて、押した人の行を更新する
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  if (user.bot) return;
+
+  const originId = groupIndex.get(reaction.message.id);
+  const entry = originId && forwarded.get(originId);
+  if (!entry) return;
+
+  const key = reaction.emoji.id ?? reaction.emoji.name;
+  const name = await displayName(reaction.message, user);
+  if (!entry.reactions.has(key)) {
+    entry.reactions.set(key, { emoji: reaction.emoji.toString(), names: new Map() });
+  }
+  entry.reactions.get(key).names.set(user.id, name);
+
+  const others = [
+    { channelId: entry.channelId, id: originId },
+    ...entry.records.map((r) => ({ channelId: r.channelId, id: r.id })),
+  ].filter((m) => m.id !== reaction.message.id);
+
+  await Promise.allSettled(
+    others.map(async (m) => {
+      try {
+        const channel = await client.channels.fetch(m.channelId);
+        const msg = await channel.messages.fetch(m.id);
+        await msg.react(reaction.emoji);
+      } catch (err) {
+        console.error('リアクションの転送に失敗:', err.message);
+      }
+    })
+  );
+
+  await refreshReactionLines(entry);
+});
+
+// リアクションが外されたら、名前を消す（誰も押していなければBotのリアクションも外す）
+client.on(Events.MessageReactionRemove, async (reaction, user) => {
+  if (user.bot) return;
+
+  const originId = groupIndex.get(reaction.message.id);
+  const entry = originId && forwarded.get(originId);
+  if (!entry) return;
+
+  const key = reaction.emoji.id ?? reaction.emoji.name;
+  const r = entry.reactions.get(key);
+  if (!r) return;
+
+  r.names.delete(user.id);
+
+  if (r.names.size === 0) {
+    entry.reactions.delete(key);
+
+    const all = [
+      { channelId: entry.channelId, id: originId },
+      ...entry.records.map((rec) => ({ channelId: rec.channelId, id: rec.id })),
+    ];
+    await Promise.allSettled(
+      all.map(async (m) => {
+        try {
+          const channel = await client.channels.fetch(m.channelId);
+          const msg = await channel.messages.fetch(m.id);
+          await msg.reactions.cache.get(key)?.users.remove(client.user.id);
+        } catch (err) {
+          console.error('リアクションの取り消しに失敗:', err.message);
+        }
+      })
+    );
+  }
+
+  await refreshReactionLines(entry);
+});
+
+client.login(process.env
